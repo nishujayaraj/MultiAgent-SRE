@@ -1,0 +1,60 @@
+RUNBOOK: High CPU Utilization
+
+Symptoms:
+- CPU usage sustained above 80% for more than 5 minutes on one or more pods
+- Increased p99 latency on service endpoints
+- Datadog alert firing on system.cpu.user or kubernetes.cpu.usage.total
+- Throttling events visible in kubectl top pods output
+- HPA (Horizontal Pod Autoscaler) has already scaled but CPU remains high
+
+Common Causes:
+1. Runaway thread or goroutine caused by an infinite loop or tight retry loop
+2. Sudden traffic spike beyond current pod capacity
+3. Expensive database query returning unexpectedly large result sets
+4. Memory pressure forcing excessive garbage collection cycles
+5. A newly deployed version with a CPU regression (missing index, inefficient algorithm)
+6. External dependency timeout causing threads to pile up waiting for a response
+
+Diagnostic Steps:
+1. Check current CPU usage across pods:
+   kubectl top pods -n <namespace> --sort-by=cpu
+
+2. Identify which container is consuming CPU:
+   kubectl top pods -n <namespace> --containers
+
+3. Compare against HPA state:
+   kubectl get hpa -n <namespace>
+
+4. Pull recent logs for errors or tight-loop indicators:
+   kubectl logs -n <namespace> <pod-name> --tail=200 | grep -iE "retry|loop|timeout|exception"
+
+5. Check Datadog APM traces for the slowest endpoints during the spike window
+
+6. Profile the running process if accessible (e.g., pprof for Go, jstack for JVM):
+   kubectl exec -n <namespace> <pod-name> -- kill -3 <pid>   # JVM thread dump
+
+7. Review recent deployments:
+   kubectl rollout history deployment/<name> -n <namespace>
+
+8. Check if the issue correlates with a cron job or scheduled task firing
+
+Remediation:
+• If caused by a traffic spike: trigger manual HPA scale-up
+  kubectl scale deployment/<name> --replicas=<n> -n <namespace>
+
+• If a new deployment is the culprit: roll back immediately
+  kubectl rollout undo deployment/<name> -n <namespace>
+
+• If a specific pod is the offender and others are healthy: delete it to force rescheduling
+  kubectl delete pod <pod-name> -n <namespace>
+
+• Add or tighten CPU resource limits in the Deployment spec to prevent noisy-neighbor impact
+
+• If caused by DB query: kill the offending query via pg_stat_activity and add a missing index
+
+• Increase JVM heap or tune GC flags if GC overhead is the root cause
+
+Escalation:
+- Page the on-call backend engineer if CPU stays above 90% for more than 10 minutes and auto-scaling has not resolved it
+- Escalate to the service owner team lead if a rollback is needed and the on-call engineer cannot determine root cause within 30 minutes
+- Page the DBA team if the high CPU correlates with slow query activity in Datadog or pg_stat_activity

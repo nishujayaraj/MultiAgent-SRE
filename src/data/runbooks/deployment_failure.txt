@@ -1,0 +1,75 @@
+RUNBOOK: Deployment Failure / Stuck Rollout
+
+Symptoms:
+- kubectl rollout status deployment/<name> hangs or returns "error: deployment exceeded its progress deadline"
+- New pods are not becoming Ready; old pods are still serving traffic
+- Datadog alert on kubernetes.deployment.replicas_unavailable
+- CI/CD pipeline (ArgoCD, FluxCD, GitHub Actions) reports deployment failure
+- kubectl get events -n <namespace> shows FailedCreate or FailedScheduling events
+
+Common Causes:
+1. New image tag does not exist or cannot be pulled (ImagePullBackOff)
+2. Resource quota in the namespace exceeded; new pods cannot be scheduled
+3. New pods failing readiness probe due to a startup bug or misconfiguration
+4. Node selector or affinity rules cannot be satisfied (no matching nodes)
+5. PersistentVolumeClaim cannot be bound (no available PV or wrong StorageClass)
+6. Deployment strategy (RollingUpdate) cannot proceed because minAvailable is not met
+7. Admission webhook rejecting the new pod spec (OPA/Gatekeeper policy violation)
+
+Diagnostic Steps:
+1. Check the rollout status:
+   kubectl rollout status deployment/<name> -n <namespace> --timeout=60s
+
+2. Get detailed pod scheduling and startup events:
+   kubectl get events -n <namespace> --sort-by=.metadata.creationTimestamp | tail -30
+
+3. Identify which pods are stuck and why:
+   kubectl get pods -n <namespace> -l app=<name>
+   kubectl describe pod <stuck-pod-name> -n <namespace>
+
+4. Check for ImagePullBackOff:
+   kubectl describe pod <pod-name> -n <namespace> | grep -A5 "Failed\|Back-off"
+
+5. Verify the image tag exists in the registry:
+   docker manifest inspect <image>:<tag>
+   # Or check the ECR/GCR console
+
+6. Check namespace resource quotas:
+   kubectl describe resourcequota -n <namespace>
+   kubectl top nodes
+
+7. Review readiness probe logs if pods are starting but not becoming Ready:
+   kubectl logs <new-pod-name> -n <namespace> --tail=100
+
+8. Check ArgoCD or FluxCD for sync status and error details:
+   argocd app get <app-name>
+   argocd app sync-status <app-name>
+
+9. Inspect admission webhook logs if pods are rejected at creation:
+   kubectl logs -n opa-system -l app=gatekeeper --tail=50
+
+Remediation:
+• Roll back to the last known-good version immediately if the service is impacted:
+  kubectl rollout undo deployment/<name> -n <namespace>
+
+• If ImagePullBackOff: verify the image tag and update imagePullSecrets if registry auth has rotated
+  kubectl patch deployment/<name> -n <namespace> -p '{"spec":{"template":{"spec":{"imagePullSecrets":[{"name":"<secret>"}]}}}}'
+
+• If quota exceeded: request a quota increase or scale down another deployment temporarily
+  kubectl delete pod <low-priority-pod> -n <namespace>
+
+• If node scheduling fails due to affinity: relax the node selector or add nodes to the cluster
+
+• Pause a stuck rollout to investigate without further changes:
+  kubectl rollout pause deployment/<name> -n <namespace>
+
+• Resume after fixing the root cause:
+  kubectl rollout resume deployment/<name> -n <namespace>
+
+• Increase the progressDeadlineSeconds if the deployment is slow but healthy:
+  kubectl patch deployment/<name> -n <namespace> -p '{"spec":{"progressDeadlineSeconds":600}}'
+
+Escalation:
+- Page the on-call platform engineer if the deployment is stuck and the service is degraded with no clear path to rollback
+- Escalate to the release engineering team if ArgoCD or FluxCD itself is the source of the failure
+- Page the infrastructure team if the root cause is node unavailability or cluster-level resource exhaustion

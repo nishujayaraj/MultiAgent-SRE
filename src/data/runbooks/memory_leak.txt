@@ -1,0 +1,65 @@
+RUNBOOK: Memory Leak / OOM
+
+Symptoms:
+- Pod memory usage climbing steadily over hours without plateauing
+- OOMKilled events in kubectl describe pod output
+- Datadog alert on kubernetes.memory.usage or container.memory.usage
+- Increasing GC pause times in JVM metrics (if Java service)
+- Pod restarts incrementing in kubectl get pods (RESTARTS column)
+- CrashLoopBackOff following repeated OOMKill events
+
+Common Causes:
+1. Unbounded in-memory cache that never evicts entries
+2. Connection objects (DB, HTTP clients) not being closed after use
+3. Event listeners or goroutines accumulating and never being released
+4. Large batch jobs loading entire datasets into memory instead of streaming
+5. Third-party library with a known memory leak in the version in use
+6. Heap fragmentation in long-running JVM processes
+
+Diagnostic Steps:
+1. Confirm memory trend over time in Datadog (look for sawtooth vs. steady climb):
+   Dashboard → Kubernetes → Container Memory → filter by service
+
+2. Check pod restart count and OOMKill events:
+   kubectl describe pod <pod-name> -n <namespace> | grep -A5 "OOMKilled\|Last State"
+
+3. Get current memory usage per pod:
+   kubectl top pods -n <namespace> --sort-by=memory
+
+4. For JVM services, capture a heap dump before the pod OOMs:
+   kubectl exec -n <namespace> <pod-name> -- jmap -dump:format=b,file=/tmp/heap.hprof <pid>
+   kubectl cp <namespace>/<pod-name>:/tmp/heap.hprof ./heap.hprof
+
+5. Analyze heap dump with Eclipse MAT or VisualVM to identify top retained objects
+
+6. For Go services, expose pprof and capture a heap profile:
+   kubectl port-forward <pod-name> 6060:6060 -n <namespace>
+   curl http://localhost:6060/debug/pprof/heap > heap.out
+   go tool pprof heap.out
+
+7. Review application logs for "out of memory" or GC overhead warnings:
+   kubectl logs <pod-name> -n <namespace> | grep -iE "OutOfMemory|GC overhead|heap"
+
+8. Check if the leak started after a recent deployment:
+   kubectl rollout history deployment/<name> -n <namespace>
+
+Remediation:
+• Increase memory limits as a short-term mitigation to buy time for a proper fix:
+  kubectl set resources deployment/<name> -c <container> --limits=memory=2Gi -n <namespace>
+
+• Roll back to the last stable version if a recent deploy introduced the regression:
+  kubectl rollout undo deployment/<name> -n <namespace>
+
+• Restart affected pods on a schedule (circuit-breaker) while the fix is developed:
+  kubectl rollout restart deployment/<name> -n <namespace>
+
+• Patch the identified leak (close connections, add cache eviction policy, fix listener teardown)
+
+• Set explicit memory limits and requests in Deployment spec if not already present
+
+• Add Datadog memory growth rate alert (bytes/hour threshold) for earlier detection
+
+Escalation:
+- Page on-call engineer if any pod hits OOMKill and restarts more than 3 times within 1 hour
+- Escalate to the service owner if root cause is not identified within 45 minutes
+- Page the platform/SRE team if the issue affects multiple services simultaneously, suggesting a shared library or infrastructure problem

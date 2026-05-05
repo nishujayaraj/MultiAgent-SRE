@@ -1,0 +1,69 @@
+RUNBOOK: Pod CrashLoopBackOff
+
+Symptoms:
+- kubectl get pods shows STATUS: CrashLoopBackOff with high RESTARTS count
+- Datadog alert on kubernetes.containers.restarts or kubernetes.pods.running drops
+- PagerDuty alert from kube-state-metrics: kube_pod_container_status_waiting_reason{reason="CrashLoopBackOff"}
+- Service health checks failing in the load balancer
+- Endpoints removed from the Service by Kubernetes readiness probe failures
+
+Common Causes:
+1. Application startup error due to missing or incorrect environment variable (e.g., bad DB URL)
+2. Crash on startup due to failed dependency connection (DB, Redis, external API unavailable)
+3. OOMKilled immediately after start due to insufficient memory limit
+4. Failed liveness probe causing Kubernetes to kill and restart the pod in a loop
+5. Misconfigured command or entrypoint in the container image (wrong binary path)
+6. A recent deployment introduced a regression that causes a panic on first request
+7. Init container failing and blocking the main container from starting
+
+Diagnostic Steps:
+1. Get the current pod status and restart count:
+   kubectl get pods -n <namespace> -l app=<name>
+
+2. Describe the pod to see events and last termination reason:
+   kubectl describe pod <pod-name> -n <namespace>
+   # Look for: Last State, Exit Code, Reason (OOMKilled, Error, etc.)
+
+3. Read logs from the previous crashed container instance:
+   kubectl logs <pod-name> -n <namespace> --previous
+
+4. Check init container status separately:
+   kubectl logs <pod-name> -n <namespace> -c <init-container-name>
+
+5. Verify environment variables and secrets are correctly mounted:
+   kubectl exec -n <namespace> <pod-name> -- env | grep -iE "DB_|REDIS_|API_|HOST"
+   kubectl get secret <secret-name> -n <namespace> -o jsonpath='{.data}' | base64 -d
+
+6. Check if the image tag resolves to the expected version:
+   kubectl get pod <pod-name> -n <namespace> -o jsonpath='{.spec.containers[*].image}'
+
+7. Check liveness probe configuration and recent probe failures:
+   kubectl describe pod <pod-name> -n <namespace> | grep -A10 "Liveness"
+
+8. Look at deployment rollout history:
+   kubectl rollout history deployment/<name> -n <namespace>
+
+Remediation:
+• If caused by a bad deployment: roll back immediately
+  kubectl rollout undo deployment/<name> -n <namespace>
+
+• If caused by a missing secret or ConfigMap: create or fix it, then trigger a rolling restart
+  kubectl create secret generic <name> --from-literal=KEY=value -n <namespace>
+  kubectl rollout restart deployment/<name> -n <namespace>
+
+• If OOMKilled: increase the memory limit as a short-term fix
+  kubectl set resources deployment/<name> -c <container> --limits=memory=1Gi -n <namespace>
+
+• If a dependency (DB/Redis) is down: fix the dependency first; the pods will recover automatically once readiness probes pass
+
+• If liveness probe is misconfigured (too aggressive): patch the probe thresholds
+  kubectl patch deployment/<name> -n <namespace> --type=json \
+    -p='[{"op":"replace","path":"/spec/template/spec/containers/0/livenessProbe/failureThreshold","value":5}]'
+
+• Temporarily set replicas to 0 to stop the crash loop while investigating without generating noise:
+  kubectl scale deployment/<name> --replicas=0 -n <namespace>
+
+Escalation:
+- Page the on-call engineer immediately if the CrashLoopBackOff causes full service unavailability
+- Escalate to the deployment team if a rollback is not sufficient and the issue persists across multiple image versions
+- Page the infrastructure team if the crash is caused by a node-level issue (disk pressure, node NotReady)

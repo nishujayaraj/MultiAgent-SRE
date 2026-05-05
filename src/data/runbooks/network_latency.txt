@@ -1,0 +1,73 @@
+RUNBOOK: Network Latency / Packet Loss
+
+Symptoms:
+- Datadog alert on network.bytes_rcvd, tcp.retransmits, or service-to-service p99 latency exceeding SLO
+- Increased timeouts between microservices visible in distributed traces (Datadog APM / Jaeger)
+- Intermittent 504 Gateway Timeout errors from the API gateway or ingress
+- kubectl exec ping between pods showing elevated RTT or packet drops
+- Service mesh (Istio/Linkerd) reporting upstream connection errors or retries
+
+Common Causes:
+1. Network policy misconfiguration blocking traffic between namespaces after a recent change
+2. CNI plugin (Calico, Cilium) in a degraded state on one or more nodes
+3. Node NIC saturation causing packet drops at the hardware level
+4. DNS resolution failures or slow DNS responses from CoreDNS (causing latency spikes at request start)
+5. Istio sidecar proxy (Envoy) misconfigured or restarting, causing connection resets
+6. AWS/GCP network throttling due to instance type bandwidth limits being exceeded
+7. MTU mismatch causing packet fragmentation between VPC and on-premise or across peering connections
+
+Diagnostic Steps:
+1. Identify which service-to-service path is affected using Datadog APM service map
+
+2. Measure RTT between two pods on the suspected path:
+   kubectl exec -n <namespace> <source-pod> -- ping -c 20 <target-pod-ip>
+
+3. Check for packet loss with a larger sample:
+   kubectl exec -n <namespace> <source-pod> -- ping -c 100 -i 0.2 <target-pod-ip> | tail -3
+
+4. Run a traceroute to identify where latency is introduced:
+   kubectl exec -n <namespace> <source-pod> -- traceroute <target-pod-ip>
+
+5. Check CoreDNS health and response times:
+   kubectl get pods -n kube-system -l k8s-app=kube-dns
+   kubectl logs -n kube-system -l k8s-app=kube-dns --tail=50 | grep -iE "error|timeout|loop"
+   # Test DNS resolution speed:
+   kubectl exec -n <namespace> <pod-name> -- time nslookup <service-name>.<namespace>.svc.cluster.local
+
+6. Inspect Istio/Envoy proxy stats for connection errors:
+   kubectl exec -n <namespace> <pod-name> -c istio-proxy -- pilot-agent request GET stats | grep -E "overflow|reset|timeout"
+
+7. Check NetworkPolicy objects that might be blocking traffic:
+   kubectl get networkpolicy -n <namespace>
+   kubectl describe networkpolicy <policy-name> -n <namespace>
+
+8. Check node-level network interface stats:
+   kubectl debug node/<node-name> -it --image=nicolaka/netshoot -- \
+     sar -n DEV 1 5
+
+9. Verify MTU settings across pods and nodes:
+   kubectl exec -n <namespace> <pod-name> -- ip link show eth0
+
+Remediation:
+• If NetworkPolicy is blocking traffic: add the required ingress/egress rule and apply
+  kubectl apply -f updated-network-policy.yaml
+
+• If CoreDNS is the bottleneck: scale up CoreDNS replicas and add NodeLocal DNSCache
+  kubectl scale deployment coredns --replicas=4 -n kube-system
+
+• If Istio sidecar is misbehaving: restart the proxy sidecar without restarting the main container
+  kubectl rollout restart deployment/<name> -n <namespace>
+
+• If NIC saturation on a specific node: cordon the node and drain workloads to others
+  kubectl cordon <node-name>
+  kubectl drain <node-name> --ignore-daemonsets --delete-emptydir-data
+
+• If MTU mismatch: patch the CNI configuration to set the correct MTU value (typically 1450 for VPC overlay)
+
+• Enable Istio retry policies as a short-term mitigation for transient packet loss:
+  Apply a VirtualService with retries: attempts: 3, perTryTimeout: 2s
+
+Escalation:
+- Page the platform/network on-call engineer if packet loss exceeds 1% between any two services and cannot be resolved within 15 minutes
+- Escalate to the cloud infrastructure team if the issue is traced to a VPC-level routing problem or an AWS/GCP network anomaly
+- Page the service mesh team if Istio control plane (istiod) is in a degraded state affecting multiple namespaces

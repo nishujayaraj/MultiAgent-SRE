@@ -1,0 +1,69 @@
+RUNBOOK: Redis Timeout / Connection Failure
+
+Symptoms:
+- Application errors: "redis.exceptions.TimeoutError", "ETIMEDOUT connecting to Redis", or "RedisCommandTimeoutException"
+- Datadog alert on redis.net.instantaneous_ops_per_sec drop or redis.mem.used_rss spike
+- Elevated cache miss rate causing downstream DB load to spike
+- Session store errors causing users to be logged out unexpectedly
+- Rate limiting or feature flag service degraded (if Redis-backed)
+
+Common Causes:
+1. Redis memory limit reached, causing eviction of hot keys and latency spikes during eviction
+2. A large KEYS * or SMEMBERS call on a massive set blocking the Redis event loop (Redis is single-threaded)
+3. Network partition between the application pods and the Redis cluster
+4. Redis persistence (AOF rewrite or RDB snapshot) blocking the main thread
+5. Too many simultaneous connections exhausting the Redis maxclients limit
+6. Cluster failover in progress (Redis Sentinel or ElastiCache promoting a new primary)
+7. Application using a non-pipelined client making high-frequency sequential calls
+
+Diagnostic Steps:
+1. Check Redis server info and memory usage:
+   redis-cli -h <redis-host> -p 6379 INFO memory | grep -E "used_memory_human|mem_fragmentation"
+   redis-cli -h <redis-host> -p 6379 INFO stats | grep -E "evicted_keys|rejected_connections"
+
+2. Check current connected clients and command latency:
+   redis-cli -h <redis-host> -p 6379 INFO clients
+   redis-cli -h <redis-host> -p 6379 LATENCY HISTORY event
+
+3. Find slow commands using the slowlog:
+   redis-cli -h <redis-host> -p 6379 SLOWLOG GET 10
+
+4. Monitor live commands to find blocking calls:
+   redis-cli -h <redis-host> -p 6379 MONITOR  # Use briefly — high overhead
+
+5. Check keyspace and top memory consumers:
+   redis-cli -h <redis-host> -p 6379 INFO keyspace
+   redis-cli -h <redis-host> -p 6379 --bigkeys
+
+6. Verify network connectivity from an application pod:
+   kubectl exec -n <namespace> <pod-name> -- nc -zv <redis-host> 6379
+
+7. Check Redis cluster node status (if using Redis Cluster):
+   redis-cli -h <redis-host> -p 6379 CLUSTER NODES
+   redis-cli -h <redis-host> -p 6379 CLUSTER INFO | grep cluster_state
+
+8. Check Datadog Redis integration dashboard for replication lag and command duration trends
+
+Remediation:
+• If memory is exhausted and eviction is causing latency: increase maxmemory or switch eviction policy
+  redis-cli -h <redis-host> CONFIG SET maxmemory 4gb
+  redis-cli -h <redis-host> CONFIG SET maxmemory-policy allkeys-lru
+
+• Kill a blocking slow command identified in SLOWLOG:
+  redis-cli -h <redis-host> CLIENT LIST | grep <suspect-command>
+  redis-cli -h <redis-host> CLIENT KILL ID <client-id>
+
+• Disable AOF rewrite temporarily if it is causing fork latency:
+  redis-cli -h <redis-host> CONFIG SET auto-aof-rewrite-percentage 0
+
+• If connection limit is hit: increase maxclients and restart non-essential consumers
+  redis-cli -h <redis-host> CONFIG SET maxclients 10000
+
+• If cluster is mid-failover: wait for ElastiCache/Sentinel to promote the new primary (typically < 30s); update the application endpoint if using a direct IP instead of a DNS name
+
+• Implement read-through cache fallback in the application to serve from DB during Redis outage
+
+Escalation:
+- Page the on-call infrastructure engineer immediately if Redis is completely unreachable and the service has no fallback
+- Escalate to the data platform team if the root cause is a cluster-level configuration issue (replication, sharding)
+- Page the on-call DBA if the Redis outage is causing DB connection exhaustion due to missed cache

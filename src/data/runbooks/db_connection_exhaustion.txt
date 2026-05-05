@@ -1,0 +1,70 @@
+RUNBOOK: Database Connection Pool Exhaustion
+
+Symptoms:
+- Application errors: "HikariPool-1 - Connection is not available, request timed out after 30000ms"
+- PgBouncer logs showing: "max_client_conn reached" or "no more connections allowed"
+- Datadog alert on hikaricp.connections.pending or pgbouncer.cl_waiting
+- Elevated 500 error rate on database-backed endpoints
+- pg_stat_activity showing many connections in "idle in transaction" state
+- New requests queuing or failing immediately with connection acquisition errors
+
+Common Causes:
+1. HikariCP pool size too small for current traffic load
+2. Long-running transactions holding connections open and blocking the pool
+3. Application code path that acquires a connection but fails to release it (missing try-finally)
+4. PgBouncer pool_mode set to session instead of transaction, causing connections to be held for the full session
+5. A slow external call made while holding a DB connection (e.g., HTTP call inside a transaction)
+6. Sudden traffic spike exhausting a previously adequate pool configuration
+7. Database replica lag causing reads to fall back to primary, doubling primary connection load
+
+Diagnostic Steps:
+1. Check current HikariCP pool metrics (if exposed via Micrometer/Prometheus):
+   kubectl port-forward svc/<service> 8080:8080 -n <namespace>
+   curl http://localhost:8080/actuator/metrics/hikaricp.connections.active
+
+2. Inspect live connections in PostgreSQL:
+   SELECT pid, state, wait_event_type, wait_event, query_start, query
+   FROM pg_stat_activity
+   WHERE datname = '<db_name>'
+   ORDER BY query_start;
+
+3. Find idle-in-transaction connections older than 60 seconds:
+   SELECT pid, state, now() - query_start AS duration, query
+   FROM pg_stat_activity
+   WHERE state = 'idle in transaction'
+     AND now() - query_start > interval '60 seconds';
+
+4. Check PgBouncer stats:
+   psql -h <pgbouncer-host> -p 6432 -U pgbouncer pgbouncer -c "SHOW POOLS;"
+   psql -h <pgbouncer-host> -p 6432 -U pgbouncer pgbouncer -c "SHOW CLIENTS;"
+
+5. Review application logs for HikariCP timeout messages and the stack trace:
+   kubectl logs -n <namespace> <pod-name> --tail=500 | grep -i "hikari\|connection"
+
+6. Check if replicas are healthy and receiving read traffic:
+   kubectl get pods -n <namespace> -l role=replica
+
+Remediation:
+• Immediately kill long-running idle-in-transaction connections to free the pool:
+  SELECT pg_terminate_backend(pid)
+  FROM pg_stat_activity
+  WHERE state = 'idle in transaction'
+    AND now() - query_start > interval '2 minutes';
+
+• Temporarily increase HikariCP maximumPoolSize via environment variable and rolling restart:
+  kubectl set env deployment/<name> HIKARI_MAX_POOL_SIZE=30 -n <namespace>
+
+• Switch PgBouncer pool_mode to transaction if it is currently set to session:
+  Edit pgbouncer.ini: pool_mode = transaction
+  Reload: psql -h <pgbouncer-host> -p 6432 -U pgbouncer pgbouncer -c "RELOAD;"
+
+• Add a statement_timeout and idle_in_transaction_session_timeout in PostgreSQL to auto-kill stuck sessions:
+  ALTER DATABASE <db> SET idle_in_transaction_session_timeout = '120s';
+
+• Scale up the application deployment to spread connections across more pods if load is the cause:
+  kubectl scale deployment/<name> --replicas=<n> -n <namespace>
+
+Escalation:
+- Page the DBA on-call if idle-in-transaction connections cannot be safely terminated or if the database is approaching max_connections
+- Escalate to the service owner lead if pool exhaustion persists more than 15 minutes after mitigation attempts
+- Page the platform team if PgBouncer itself is crashing or unresponsive
