@@ -1,16 +1,37 @@
 # MultiAgent-SRE
 
-An AI-powered incident response pipeline that replaces the 3am pager dread with a coordinated multi-agent system — from raw alert to Jira ticket in under 60 seconds.
+> An AI system that handles the first 15 minutes of any production incident, so you don't have to do it half-asleep at 3am.
 
-## The Problem
+---
 
-At 3am, a PagerDuty alert fires. A human engineer wakes up, opens five browser tabs — Datadog, Kubernetes dashboard, Jira, Confluence runbooks, and Slack — and spends the first 15 minutes just understanding what is happening. Is the database down or just slow? Which services are affected? What did the runbook say to do last time this happened? Every minute of confusion is thousands of failed transactions, frustrated users, and lost revenue. The cognitive load of context-switching between tools while half-asleep is where most of the incident resolution time goes — not the actual fix.
+## The Problem It Solves
 
-MultiAgent-SRE automates the *diagnostic and planning* layer of incident response. When an alert fires, a graph of specialized AI agents runs in parallel: one reads the logs, one searches the runbook library, one estimates the blast radius. They synthesize their findings into a root cause with a confidence score, generate a prioritized remediation plan with risk levels and kubectl/psql commands, and route to a human checkpoint only when the severity or uncertainty demands it. The on-call engineer arrives at a fully formed incident brief — not a blank screen.
+Picture this: it's 3am, PagerDuty wakes you up. You open five tabs — Datadog, Kubernetes dashboard, Jira, Confluence, Slack — and spend the next 15 minutes just trying to understand *what is happening*. Is the database down or just slow? Which services are affected? What was the fix last time this happened? By the time you've connected the dots, real users have already had a bad experience.
+
+Here's the thing, the actual fix usually takes only 5 minutes. The *diagnosis* is what eats your time.
+
+**MultiAgent-SRE automates that diagnosis.** The moment an alert fires, a team of AI agents springs into action: one reads your logs, one searches your runbook library, one estimates how many users are affected. They work simultaneously, share their findings, and hand you a complete incident brief. Root cause identified, remediation steps ranked by risk, Jira ticket drafted. You arrive at a decision, not a blank screen.
+
+---
+
+## How It Works
+
+Here's the journey an alert takes through the system:
+
+1. **Alert comes in** → The Supervisor agent reads it, classifies the incident type, and sets the severity level
+2. **Three agents work in parallel** → Log Analyzer digs through raw logs, Runbook RAG searches your runbook library using semantic search, Impact Assessor estimates affected users and services
+3. **Root Cause synthesized** → A dedicated agent takes all three outputs and builds a causal chain with a confidence score
+4. **Remediation planned** → Another agent generates 3–5 prioritized steps with real commands (kubectl, psql, etc.) and risk levels
+5. **Human decision point** → If the incident is CRITICAL or the AI isn't confident enough, it pauses and asks you: *execute or escalate?*
+6. **Ticket created** → A structured Jira ticket with the full incident report is generated automatically
+
+Total time from alert to brief: **under 60 seconds.**
 
 ---
 
 ## Architecture
+
+The pipeline is a LangGraph `StateGraph` — not a sequential chain, but a real graph with parallel branches and conditional routing.
 
 ```
                         +------------------+
@@ -30,7 +51,7 @@ MultiAgent-SRE automates the *diagnostic and planning* layer of incident respons
    +-------+-------+   +------+-------+   +---------+--------+
            |                  |                     |
            +------------------+---------------------+
-                              | (fan-in)
+                         (all 3 merge here)
                               v
                      +------------------+
                      |   ROOT CAUSE     |
@@ -41,140 +62,146 @@ MultiAgent-SRE automates the *diagnostic and planning* layer of incident respons
                               v
                    +---------------------+
                    | REMEDIATION PLANNER |
-                   |  3-5 steps          |
-                   |  risk + eta per step|
+                   |  3-5 ranked steps   |
+                   |  risk + time per step|
                    +---------+-----------+
                              |
             +----------------+----------------+
-            | severity=CRITICAL               |
-            | OR confidence < 0.7             | (else: auto)
+            |  CRITICAL severity              |
+            |  OR confidence < 70%            |  (otherwise auto)
             v                                 v
    +------------------+             +------------------+
    | HUMAN CHECKPOINT |             |  TICKET CREATOR  |
-   |  stdin decision  +------------>|  Jira + summary  |
-   |  execute/escalate|             |  mock_tools call |
+   | execute/escalate +------------>|  Jira + summary  |
    +------------------+             +---------+--------+
                                               |
                                               v
                                             [END]
 ```
 
+The three middle agents (Log Analyzer, Runbook RAG, Impact Assessor) run **in parallel**, LangGraph fans out after the Supervisor and fans back in before Root Cause. This cuts diagnosis time from ~15s sequential to ~5s.
+
 ---
 
-## Agents
+## The Agents
 
-| Agent | Inputs from State | LLM | Outputs to State |
+Each agent has one job. It reads what it needs from shared state, does its work, and writes its output back.
+
+| Agent | What it does | Uses LLM? | Key outputs |
 |---|---|---|---|
-| **Supervisor** | `alert_message`, `service_name`, `environment` | Yes | `classification`, `severity`, `status` |
-| **Log Analyzer** | `raw_logs`, `alert_message` | Yes | `error_patterns`, `anomalies`, `log_summary` |
-| **Runbook RAG** | `alert_message` | No (ChromaDB) | `relevant_runbooks` |
-| **Impact Assessor** | `service_name`, `environment`, `alert_message` | Yes | `affected_services`, `estimated_users_impacted`, `blast_radius` |
-| **Root Cause** | `log_summary`, `error_patterns`, `relevant_runbooks`, `blast_radius` | Yes | `root_cause`, `confidence_score`, `causal_chain` |
-| **Remediation Planner** | `root_cause`, `relevant_runbooks`, `severity` | Yes | `remediation_steps`, `recommended_action` |
-| **Human Checkpoint** | Full state | No (stdin) | `human_decision` |
-| **Ticket Creator** | Full incident context | Yes | `ticket_id`, `resolution_summary` |
+| **Supervisor** | Reads the alert, picks the incident type, sets severity | Yes | `classification`, `severity` |
+| **Log Analyzer** | Finds error patterns and anomalies in raw logs | Yes | `error_patterns`, `anomalies`, `log_summary` |
+| **Runbook RAG** | Semantic search over your runbook library (ChromaDB) | No | `relevant_runbooks` |
+| **Impact Assessor** | Estimates affected services and user count | Yes | `blast_radius`, `estimated_users_impacted` |
+| **Root Cause** | Synthesizes everything into a causal chain + confidence score | Yes | `root_cause`, `confidence_score`, `causal_chain` |
+| **Remediation Planner** | Generates ranked steps with real commands and risk levels | Yes | `remediation_steps`, `recommended_action` |
+| **Human Checkpoint** | Asks the on-call engineer to decide: execute or escalate | No (stdin) | `human_decision` |
+| **Ticket Creator** | Writes a structured Jira incident ticket | Yes | `ticket_id`, `resolution_summary` |
 
 ---
 
 ## Tech Stack
 
-| Component | Tool / Library | Why |
+| What | Tool | Why this one |
 |---|---|---|
-| LLM | `claude-haiku-4-5-20251001` via Anthropic | Fast, cheap, strong reasoning — production SRE needs sub-second latency |
-| Agent Orchestration | LangGraph `StateGraph` | Native parallel fan-out/fan-in, conditional routing, typed state |
-| LLM Client | `langchain-anthropic` | Structured message formatting, clean tool integration |
-| Vector Store | ChromaDB (persistent local) | Zero infrastructure — builds once from `.txt` runbooks, reuses forever |
-| Embedding Model | `all-MiniLM-L6-v2` (sentence-transformers) | 80MB, fast, accurate enough for runbook similarity |
-| Observability | Langfuse | Per-agent span tracing: inputs, outputs, and latency per run |
-| State Schema | Python `TypedDict` + `Annotated` | Type-safe state with `operator.add` reducer for parallel message merges |
-| Config | `python-dotenv` | `.env` file — zero hardcoded secrets anywhere |
+| LLM | Claude Haiku 4.5 (`claude-haiku-4-5-20251001`) | Fast and cheap — important when every second of an incident counts |
+| Agent Orchestration | LangGraph `StateGraph` | Handles parallel execution and conditional routing out of the box |
+| LLM Client | `langchain-anthropic` | Clean message formatting, easy to swap models |
+| Runbook Search | ChromaDB + `all-MiniLM-L6-v2` | Runs locally, no external service needed, persists between runs |
+| Observability | Langfuse | See exactly what each agent received, returned, and how long it took |
+| State | Python `TypedDict` + `Annotated` | Type-safe, catches mistakes at runtime before they cause silent bugs |
+| Config | `python-dotenv` | Secrets in `.env`, never hardcoded |
 
 ---
 
-## Quickstart
+## Getting Started
+
+You only need an Anthropic API key to run this. Langfuse is optional.
 
 ```bash
-# 1. Clone
-git clone https://github.com/yourusername/MultiAgent-SRE.git
+# 1. Clone the repo
+git clone https://github.com/nishujayaraj/MultiAgent-SRE.git
 cd MultiAgent-SRE
 
-# 2. Create virtual environment
+# 2. Create a virtual environment
 python -m venv .venv
-source .venv/bin/activate      # Windows: .venv\Scripts\activate
+source .venv/bin/activate        # Windows: .venv\Scripts\activate
 
 # 3. Install dependencies
 pip install -r requirements.txt
 
-# 4. Configure secrets
+# 4. Set up your API key
 cp .env.example .env
-# Edit .env — only ANTHROPIC_API_KEY is required.
-# Langfuse keys are optional (tracing is silently skipped if not set).
+# Open .env and add your ANTHROPIC_API_KEY
+# Langfuse keys are optional — the system works fine without them
 
-# 5. Run
+# 5. Run it
 python main.py
 ```
 
-You will be prompted to choose a scenario. On first run, ChromaDB will embed the 8 runbook files (~5 seconds). Subsequent runs load the persisted collection instantly.
+On first run, ChromaDB will embed the 8 runbook files (takes ~5 seconds). Every run after that loads the saved collection instantly.
 
 ---
 
-## Sample Output (Scenario 1 — INC-001)
+## Try It — Three Built-in Scenarios
+
+When you run `python main.py`, you pick one of three pre-built incidents:
 
 ```
-══════════════════════════════════════════════════════════════════
-  MultiAgent SRE — AI-Powered Incident Response Pipeline
-══════════════════════════════════════════════════════════════════
-
-  Select a scenario:
-
   [1] INC-001 — DB connection pool pressure
-      payments-service | prod | ~HIGH severity | auto path
+      payments-service | prod | HIGH severity | no human checkpoint
 
   [2] INC-002 — OOMKilled memory leak, CrashLoopBackOff
-      recommendation-service | prod | CRITICAL | ⚠ human checkpoint
+      recommendation-service | prod | CRITICAL | ⚠ asks for your decision
 
   [3] INC-003 — Sustained high CPU at 94% for 8 minutes
-      data-pipeline | staging | ~MEDIUM severity | auto path
+      data-pipeline | staging | MEDIUM severity | no human checkpoint
+```
 
-  Enter scenario number (1/2/3): 1
+Scenario 2 is the interesting one, it fires the human checkpoint, shows you the full brief, and waits for you to type `execute` or `escalate`.
 
-[SUPERVISOR]   alert_id=INC-001 | classification=db_connection | severity=high
-[IMPACT ASSESSOR] ~18,000 users impacted | 4 service(s) affected
-[RUNBOOK RAG]  Matched 3 runbook(s): Db Connection Exhaustion, Network Latency, Disk Space
-[LOG ANALYZER] Found 8 error pattern(s) and 4 anomaly(s) in payments-service logs
-[ROOT CAUSE]   confidence=91% | human_approval=NO
-               HikariCP pool exhaustion caused by idle-in-transaction connections...
-[REMEDIATION]  5 step(s) planned | human_approval=NO
-[TOOL]         Created Jira ticket INC-12345: [HIGH] payments-service: db_connection
-[TICKET]       Created INC-001-1778003021 for INC-001
+### Sample output (Scenario 1)
+
+```
+[SUPERVISOR]       classification=db_connection | severity=high
+[IMPACT ASSESSOR]  ~45,000 users impacted | 4 service(s) affected
+[RUNBOOK RAG]      Matched: Db Connection Exhaustion, High Cpu, Redis Timeout
+[LOG ANALYZER]     8 error patterns, 5 anomalies found
+[ROOT CAUSE]       confidence=78% | auto path (no human needed)
+[REMEDIATION]      5 steps planned
+[TICKET]           Created INC-001-1778003021
 
 ╔════════════════════════════════════════════════════════════════╗
-║           INCIDENT REPORT — MultiAgent SRE                     ║
+║              INCIDENT REPORT — MultiAgent SRE                  ║
 ╚════════════════════════════════════════════════════════════════╝
 
   Ticket ID      : INC-001-1778003021
-  Alert          : INC-001
   Service        : payments-service (prod)
-  Status         : RESOLVED
   Severity       : HIGH
   Classification : db_connection
   Human Decision : N/A — AUTO PATH
-  ...
+
+  Root Cause     : HikariPool exhausted due to idle-in-transaction
+                   connections piling up after a traffic spike.
+
+  Recommended    : SELECT pg_terminate_backend(pid) FROM
+                   pg_stat_activity WHERE state = 'idle in transaction'
+                   AND now() - query_start > interval '2 minutes';
 ```
 
 ---
 
-## Why LangGraph?
+## Why LangGraph and Not Just a Script?
 
-**StateGraph over sequential chains.** A sequential LangChain chain would force every agent to wait for the previous one to finish. LangGraph's `StateGraph` declares nodes and edges explicitly — the full pipeline is visible as a graph, not hidden inside nested function calls. This makes the flow testable, debuggable, and easy to extend.
+You could wire these agents together with plain Python, call one function, pass the result to the next, done. But this project needs three things a script can't easily give you:
 
-**Parallel fan-out/fan-in.** After the Supervisor classifies the alert, three agents run simultaneously: Log Analyzer reads the raw logs, Runbook RAG searches ChromaDB, and Impact Assessor estimates blast radius. In LangGraph this is just three `add_edge` calls from one source node. The runtime waits for all three to complete before Root Cause runs — reducing wall-clock time from ~15s sequential to ~5s parallel.
+**Parallel execution.** Log analysis, runbook search, and impact assessment have nothing to do with each other, there's no reason to run them one at a time. LangGraph fans them out after the Supervisor and waits for all three before continuing. With a script, you'd have to manage `asyncio` or threads yourself.
 
-**Conditional edges.** The human checkpoint fires only when `requires_human_approval` is True — set when severity is `critical` or root cause confidence drops below 70%. This routing logic lives in a single `add_conditional_edges` call, not scattered across agent code. Changing the threshold is a one-line edit.
+**Conditional routing.** The human checkpoint only fires under certain conditions (CRITICAL severity or low confidence). In LangGraph, this is one `add_conditional_edges` call. In a script, it's `if/else` branches that get tangled as the system grows.
 
-**State reducers.** Each parallel branch appends to the shared `messages` list independently. Without a reducer, parallel writes would overwrite each other. LangGraph's `Annotated[List[str], operator.add]` annotation tells the runtime to concatenate lists instead — all four agent messages arrive at Root Cause correctly merged, with zero extra coordination code.
+**Safe parallel state merges.** All three parallel agents append messages to the same shared list. Without a reducer, the last writer would silently overwrite the others. LangGraph's `Annotated[List[str], operator.add]` annotation tells the runtime to concatenate instead no coordination code needed.
 
-**Type-safe state.** `IncidentState` as a `TypedDict` forces every field to be declared upfront. LangGraph validates keys at runtime, so a typo in an agent's return dict raises an error immediately rather than silently dropping data.
+**Visibility.** The graph is declared explicitly: nodes, edges, conditions. You can see the full pipeline at a glance, add a new agent by adding a node and two edges, and test any agent in isolation.
 
 ---
 
@@ -184,21 +211,21 @@ You will be prompted to choose a scenario. On first run, ChromaDB will embed the
 MultiAgent-SRE/
 ├── src/
 │   ├── agents/
-│   │   ├── supervisor.py          # Alert classification + severity
-│   │   ├── log_analyzer.py        # Error pattern extraction
-│   │   ├── runbook_rag.py         # ChromaDB semantic search
-│   │   ├── impact_assessor.py     # Blast radius estimation
-│   │   ├── root_cause.py          # Causal chain synthesis
-│   │   ├── remediation_planner.py # Step-by-step remediation
-│   │   └── ticket_creator.py      # Jira ticket generation
+│   │   ├── supervisor.py           # Classifies alert, sets severity
+│   │   ├── log_analyzer.py         # Extracts error patterns from logs
+│   │   ├── runbook_rag.py          # Searches runbooks via ChromaDB
+│   │   ├── impact_assessor.py      # Estimates blast radius + user impact
+│   │   ├── root_cause.py           # Builds causal chain + confidence score
+│   │   ├── remediation_planner.py  # Generates ranked remediation steps
+│   │   └── ticket_creator.py       # Writes the Jira incident ticket
 │   ├── state/
-│   │   └── incident_state.py      # TypedDict schema + Enums
+│   │   └── incident_state.py       # Shared TypedDict state + Enums
 │   ├── tools/
-│   │   ├── mock_tools.py          # kubectl, Jira, PagerDuty stubs
-│   │   ├── runbook_loader.py      # ChromaDB embed + search
-│   │   └── observability.py       # Langfuse trace/span wrappers
-│   └── data/runbooks/             # 8 .txt SRE runbooks
-├── main.py                        # Graph definition + scenario runner
+│   │   ├── mock_tools.py           # Stub tools: kubectl, Jira, PagerDuty
+│   │   ├── runbook_loader.py       # Embeds runbooks into ChromaDB
+│   │   └── observability.py        # Langfuse trace/span wrappers
+│   └── data/runbooks/              # 8 realistic SRE runbook .txt files
+├── main.py                         # Graph definition + scenario runner
 ├── requirements.txt
 ├── .env.example
 └── README.md
