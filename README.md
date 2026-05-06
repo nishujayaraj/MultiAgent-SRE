@@ -191,6 +191,55 @@ Scenario 2 is the interesting one, it fires the human checkpoint, shows you the 
 
 ---
 
+## Benchmarks
+
+These numbers come from running the three built-in scenarios end-to-end. Each timing was averaged over 3 runs; confidence and retrieval scores are deterministic (temperature=0).
+
+### End-to-End Pipeline Time
+
+Each scenario runs 6–7 LLM calls (supervisor → 3 parallel agents → root cause → remediation → ticket). Three parallel agents run simultaneously, which cuts the middle stage from ~15s sequential to ~5s.
+
+| Scenario | Service | Severity | Avg Time (3 runs) |
+|---|---|---|---|
+| INC-001 — DB connection pool | payments-service | HIGH | **28.7s** |
+| INC-002 — OOMKilled / CrashLoopBackOff | recommendation-service | CRITICAL | **27.9s** |
+| INC-003 — Sustained high CPU | data-pipeline | MEDIUM | **33.5s** |
+
+Total time from alert input to Jira ticket: **under 35 seconds** across all scenarios.
+
+### Root Cause Confidence Scores
+
+The root cause agent scores its own certainty on a 0–1 scale. Anything below 70% triggers a human checkpoint regardless of severity.
+
+| Scenario | Root Cause (summary) | Confidence | Human Approval? | Why |
+|---|---|---|---|---|
+| INC-001 | Idle-in-transaction connections exhausting HikariPool | **82%** | No | ≥70% and severity not CRITICAL |
+| INC-002 | Unbounded cache with no eviction policy → OOM on restart | **95%** | **Yes** | CRITICAL severity override |
+| INC-003 | O(n²) JSON deserialization causing CPU saturation | **92%** | No | ≥70% and severity not CRITICAL |
+
+INC-002 triggered the human checkpoint not because confidence was low — it was the highest at 95% — but because CRITICAL severity always requires a human decision.
+
+### Runbook RAG Retrieval Accuracy
+
+Tested with 5 alert messages spanning all major incident types. The RAG returns top-3 results; accuracy is measured on the top-1 rank.
+
+| Metric | Result |
+|---|---|
+| Top-1 accuracy | **80%** (4 / 5) |
+| Top-3 recall | **100%** (5 / 5) |
+
+The one miss: an OOMKilled + CrashLoopBackOff alert retrieved *Pod Crashloop* at rank 1 (similarity 0.69) instead of *Memory Leak* (similarity slightly lower). The correct runbook was still rank 2 — so it made it into the LLM context, and root cause confidence for that scenario was 95%. Top-3 recall being 100% means the relevant runbook always reaches the reasoning agents even when rank-1 is off.
+
+| Alert | Expected | Retrieved (rank 1) | Similarity | Correct? |
+|---|---|---|---|---|
+| HikariPool exhausted, connection timeout | Db Connection Exhaustion | Db Connection Exhaustion | 0.655 | ✓ |
+| OOMKilled, CrashLoopBackOff, Java heap | Memory Leak | Pod Crashloop | 0.687 | ✗ |
+| CPU at 94%, load avg 15.2 | High Cpu | High Cpu | 0.497 | ✓ |
+| Redis NOAUTH errors, cache hit rate 12% | Redis Timeout | Redis Timeout | 0.668 | ✓ |
+| Deployment stuck, ImagePullBackOff | Deployment Failure | Deployment Failure | 0.594 | ✓ |
+
+---
+
 ## Why LangGraph and Not Just a Script?
 
 You could wire these agents together with plain Python, call one function, pass the result to the next, done. But this project needs three things a script can't easily give you:
